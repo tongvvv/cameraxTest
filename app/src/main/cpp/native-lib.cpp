@@ -235,6 +235,8 @@ Java_com_example_cameraxtest_MainActivity_nativePrepare(JNIEnv *env, jobject thi
         return false;
     }
 
+    //rknn_set_core_mask(rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_ALL);
+
     //letterbox是必要的
     letter_box.x_pad = 0;
     letter_box.y_pad = 64;

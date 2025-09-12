@@ -163,7 +163,8 @@ public class MainActivity extends AppCompatActivity
                 .build();
 
         //不填参数的话, 默认格式YUV_420_888, 对于此相机来说, 具体是yuv420sp nv12.
-        imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor(), image -> {
+        imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor(), image ->
+        {
             // 获取图像格式信息
             int format = image.getFormat();
             String formatName = getFormatName(format);
@@ -206,8 +207,10 @@ public class MainActivity extends AppCompatActivity
     }
 
     // 辅助方法：将图像格式代码转换为可读名称
-    private String getFormatName(int format) {
-        switch (format) {
+    private String getFormatName(int format)
+    {
+        switch (format)
+        {
             case ImageFormat.JPEG: return "JPEG";
             case ImageFormat.YUV_420_888: return "YUV_420_888";
             case ImageFormat.YUV_422_888: return "YUV_422_888";
