@@ -4,6 +4,7 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.util.Log;
 import android.view.View;
 
 import java.util.Locale;
@@ -11,21 +12,28 @@ import java.util.Locale;
 // 自定义绘制视图
 public class DetectionView extends View
 {
+    private final Object mLock = new Object();
     private DetectResultList mResultList;
     private Paint mBoxPaint;
     private Paint mTextPaint;
 
     private float mScale; //缩放比例(预览尺寸/原始尺寸)
 
+    private long lasttime;
+
     public DetectionView(Context context)
     {
         super(context);
         initPaints();
+        lasttime = System.nanoTime();
     }
 
     public void setScale(int imgW, int viewW)
     {
-        mScale =  viewW/(float)imgW;
+        synchronized (mLock)
+        {
+            mScale = viewW / (float) imgW;
+        }
     }
 
     private void initPaints()
@@ -45,8 +53,14 @@ public class DetectionView extends View
     // 设置检测结果
     public void setResults(DetectResultList results)
     {
-        mResultList = results;
-        invalidate(); // 触发重绘
+        synchronized (mLock)
+        {
+            mResultList = results;
+            invalidate(); // 触发重绘
+            long tmp = System.nanoTime()-lasttime;
+            lasttime = System.nanoTime();
+            Log.e("fps","画面更新速率: " + tmp/1000000.0 + "ms");
+        }
     }
 
     @Override

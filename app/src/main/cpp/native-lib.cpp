@@ -20,47 +20,46 @@
 
 //NDK Version: 19.2.5345600
 
-rknn_app_context_t rknn_app_ctx; //模型推理需要用的全局环境,包含了推理需要的各种数据
-uint8_t *background = nullptr;   //存放图像转换的结果
-image_buffer_t dst_img;          //需要传入给推理接口的对象
-letterbox_t letter_box;          //letterbox操作的参数
-object_detect_result_list od_results; //推理的结果
+static int core_mask = 0;
+// 定义线程局部存储的结构体（保持原有全局变量结构）
+struct ThreadLocalData {
+    rknn_app_context_t rknn_app_ctx;  // 模型推理环境
+    uint8_t *background = nullptr;    // 图像转换结果
+    image_buffer_t dst_img;           // 推理输入对象
+    letterbox_t letter_box;           // letterbox参数
+    object_detect_result_list od_results;  // 推理结果
 
-// 全局变量：存储类引用和方法ID（生命周期与JNI一致）
-static jclass g_imageRectCls = nullptr;
-static jmethodID g_imageRectCtor = nullptr;
-static jclass g_detectResultCls = nullptr;
-static jmethodID g_detectResultCtor = nullptr;
-static jclass g_resultListCls = nullptr;
-static jmethodID g_resultListCtor = nullptr;
+    // JNI引用
+    jclass imageRectCls = nullptr;
+    jmethodID imageRectCtor = nullptr;
+    jclass detectResultCls = nullptr;
+    jmethodID detectResultCtor = nullptr;
+    jclass resultListCls = nullptr;
+    jmethodID resultListCtor = nullptr;
+};
+
+// ThreadLocal存储：为每个线程分配独立的实例
+static thread_local ThreadLocalData* tlsData = nullptr;
 
 uint8_t* createGrayImage(int width = 640, int height = 640, uint8_t grayValue = 114) {
-    // 计算每行字节数（RGB格式，每个像素3字节）
     int bytesPerRow = width * 3;
-
-    // 计算总字节数
     int totalBytes = bytesPerRow * height;
-
-    // 分配内存
     auto* imageData = new uint8_t[totalBytes];
-
-    // 填充灰色像素（RGB三个通道值相同）
     memset(imageData, grayValue, totalBytes);
-
     return imageData;
 }
 
-// 初始化全局引用
-static bool initRefs(JNIEnv *env) {
+// 初始化当前线程的局部引用
+static bool initThreadRefs(JNIEnv *env, ThreadLocalData* data) {
     // 初始化ImageRect相关
     jclass localRectCls = env->FindClass(IMAGE_RECT_CLASS);
     if (localRectCls == nullptr) {
         env->ExceptionDescribe();
         return false;
     }
-    g_imageRectCls = (jclass)env->NewGlobalRef(localRectCls);
-    g_imageRectCtor = env->GetMethodID(g_imageRectCls, "<init>", "(IIII)V");
-    if (g_imageRectCtor == nullptr) {
+    data->imageRectCls = (jclass)env->NewGlobalRef(localRectCls);
+    data->imageRectCtor = env->GetMethodID(data->imageRectCls, "<init>", "(IIII)V");
+    if (data->imageRectCtor == nullptr) {
         env->ExceptionDescribe();
         return false;
     }
@@ -71,10 +70,10 @@ static bool initRefs(JNIEnv *env) {
         env->ExceptionDescribe();
         return false;
     }
-    g_detectResultCls = (jclass)env->NewGlobalRef(localResultCls);
-    g_detectResultCtor = env->GetMethodID(g_detectResultCls, "<init>",
-                                          "(Lcom/example/cameraxtest/ImageRect;FI)V");
-    if (g_detectResultCtor == nullptr) {
+    data->detectResultCls = (jclass)env->NewGlobalRef(localResultCls);
+    data->detectResultCtor = env->GetMethodID(data->detectResultCls, "<init>",
+                                              "(Lcom/example/cameraxtest/ImageRect;FI)V");
+    if (data->detectResultCtor == nullptr) {
         env->ExceptionDescribe();
         return false;
     }
@@ -85,117 +84,120 @@ static bool initRefs(JNIEnv *env) {
         env->ExceptionDescribe();
         return false;
     }
-    g_resultListCls = (jclass)env->NewGlobalRef(localListCls);
-    g_resultListCtor = env->GetMethodID(g_resultListCls, "<init>",
-                                        "(II[Lcom/example/cameraxtest/DetectResult;)V");
-    if (g_resultListCtor == nullptr) {
+    data->resultListCls = (jclass)env->NewGlobalRef(localListCls);
+    data->resultListCtor = env->GetMethodID(data->resultListCls, "<init>",
+                                            "(II[Lcom/example/cameraxtest/DetectResult;)V");
+    if (data->resultListCtor == nullptr) {
         env->ExceptionDescribe();
         return false;
     }
 
     return true;
 }
-// 释放全局引用
-static void releaseRefs(JNIEnv *env) {
-    if (g_imageRectCls != nullptr) {
-        env->DeleteGlobalRef(g_imageRectCls);
-        g_imageRectCls = nullptr;
+
+// 释放当前线程的局部引用
+static void releaseThreadRefs(JNIEnv *env, ThreadLocalData* data) {
+    if (data->imageRectCls != nullptr) {
+        env->DeleteGlobalRef(data->imageRectCls);
+        data->imageRectCls = nullptr;
     }
-    if (g_detectResultCls != nullptr) {
-        env->DeleteGlobalRef(g_detectResultCls);
-        g_detectResultCls = nullptr;
+    if (data->detectResultCls != nullptr) {
+        env->DeleteGlobalRef(data->detectResultCls);
+        data->detectResultCls = nullptr;
     }
-    if (g_resultListCls != nullptr) {
-        env->DeleteGlobalRef(g_resultListCls);
-        g_resultListCls = nullptr;
+    if (data->resultListCls != nullptr) {
+        env->DeleteGlobalRef(data->resultListCls);
+        data->resultListCls = nullptr;
     }
-    // 方法ID不需要手动释放（随类引用生命周期）
 }
 
-// JNI方法：将C的object_detect_result_list转换为Java的DetectResultList对象
-jobject convertResultList(JNIEnv *env, object_detect_result_list *cList)
+// 转换推理结果（使用线程局部数据）
+jobject convertResultList(JNIEnv *env, ThreadLocalData* data, object_detect_result_list *cList)
 {
-    if (cList == nullptr) return nullptr;
-    // 检查全局引用是否有效（防止意外释放）
-    if (g_imageRectCls == nullptr || g_detectResultCls == nullptr || g_resultListCls == nullptr)
+    if (cList == nullptr || data == nullptr) return nullptr;
+    if (data->imageRectCls == nullptr || data->detectResultCls == nullptr || data->resultListCls == nullptr)
     {
         return nullptr;
     }
 
-    // 创建DetectResult数组
-    jobjectArray resultArray = env->NewObjectArray(cList->count, g_detectResultCls, nullptr);
+    jobjectArray resultArray = env->NewObjectArray(cList->count, data->detectResultCls, nullptr);
     if (resultArray == nullptr)
     {
         env->ExceptionDescribe();
         return nullptr;
     }
 
-    // 遍历转换每个检测结果
     for (int i = 0; i < cList->count; i++)
     {
         object_detect_result *cResult = &(cList->results[i]);
-
-        // 创建ImageRect对象（复用全局引用）
-        jobject jRect = env->NewObject(g_imageRectCls, g_imageRectCtor,
-                                       cResult->box.left,
-                                       cResult->box.top,
-                                       cResult->box.right,
-                                       cResult->box.bottom);
+        jobject jRect = env->NewObject(data->imageRectCls, data->imageRectCtor,
+                                       cResult->box.left, cResult->box.top,
+                                       cResult->box.right, cResult->box.bottom);
         if (jRect == nullptr)
         {
             env->ExceptionDescribe();
             break;
         }
 
-        // 创建DetectResult对象（复用全局引用）
-        jobject jResult = env->NewObject(g_detectResultCls, g_detectResultCtor,
-                                         jRect,
-                                         cResult->prop,
-                                         cResult->cls_id);
-        env->DeleteLocalRef(jRect); // 释放局部引用
+        jobject jResult = env->NewObject(data->detectResultCls, data->detectResultCtor,
+                                         jRect, cResult->prop, cResult->cls_id);
+        env->DeleteLocalRef(jRect);
         if (jResult == nullptr) {
             env->ExceptionDescribe();
             break;
         }
 
-        // 添加到数组
         env->SetObjectArrayElement(resultArray, i, jResult);
         env->DeleteLocalRef(jResult);
     }
 
-    // 创建最终结果列表对象
-    jobject jList = env->NewObject(g_resultListCls, g_resultListCtor,
-                                   cList->id,
-                                   cList->count,
-                                   resultArray);
-    env->DeleteLocalRef(resultArray); // 释放数组引用
-
+    jobject jList = env->NewObject(data->resultListCls, data->resultListCtor,
+                                   cList->id, cList->count, resultArray);
+    env->DeleteLocalRef(resultArray);
     return jList;
 }
 
+// 推理方法：使用当前线程的局部数据
 extern "C" JNIEXPORT jobject JNICALL
-        Java_com_example_cameraxtest_MainActivity_imgInference(JNIEnv* env,
-                                 jobject, /* this */
-                                 jobject img,
-                                 jint width,
-                                 jint height)
+Java_com_example_cameraxtest_MainActivity_imgInference(JNIEnv* env,
+                                                       jclass clazz, /* this */
+                                                       jobject img,
+                                                       jint width,
+                                                       jint height)
 {
+    // 检查当前线程的局部数据是否初始化
+    if (tlsData == nullptr) {
+        LOGI("ThreadLocal data not initialized! Call nativePrepare first.");
+        return nullptr;
+    }
+    ThreadLocalData* data = tlsData;
     int ret;
-    //图像预处理
+
+    // 图像预处理（使用线程局部的letter_box）
+    float  scale = (float)(data->rknn_app_ctx.model_width) / width;
+    int    height_fixed = scale * height;
+    int    padsize = (data->rknn_app_ctx.model_height - height_fixed);
+    data->letter_box.x_pad = 0;
+    data->letter_box.y_pad = padsize/2;
+    data->letter_box.scale = scale;
+
     auto *imgData = static_cast<uint8_t*>(env->GetDirectBufferAddress(img));
     if (imgData == nullptr)
     {
         return env->NewStringUTF("Error: Failed to get input buffer address");
     }
-    //输入: 1280*1024  yuv420sp(nv12)
+
     const rga_buffer_t src = wrapbuffer_virtualaddr(imgData, width, height, RK_FORMAT_YCbCr_420_SP);
 
-    if(background == nullptr)
+    if(data->background == nullptr)
     {
-        background = createGrayImage(640,640,114); //生成RGB格式图片, 纯灰色的背景图
-        dst_img.virt_addr = background;
+        data->background = createGrayImage(data->rknn_app_ctx.model_width,
+                                           data->rknn_app_ctx.model_height, 114);
+        data->dst_img.virt_addr = data->background;
     }
-    rga_buffer_t dst1 = wrapbuffer_virtualaddr(background+3*640*64, 640, 512, RK_FORMAT_RGB_888);
+    rga_buffer_t dst1 = wrapbuffer_virtualaddr(data->background + 3*640*data->letter_box.y_pad,
+                                               data->rknn_app_ctx.model_width,
+                                               height_fixed, RK_FORMAT_RGB_888);
 
     IM_STATUS blendStatus = imblend(src, dst1, IM_ALPHA_BLEND_SRC_OVER);
     if(blendStatus != IM_STATUS_SUCCESS)
@@ -204,63 +206,100 @@ extern "C" JNIEXPORT jobject JNICALL
         return nullptr;
     }
 
-    ret = inference_yolov8_model(&rknn_app_ctx, &dst_img, letter_box, &od_results);
+    // 模型推理（使用线程局部的上下文）
+    ret = inference_yolov8_model(&data->rknn_app_ctx, &data->dst_img,
+                                 data->letter_box, &data->od_results);
     if(ret != 0)
     {
         LOGI("inference_yolov8_model fail! ret=%d\n", ret);
     }
 
-    return convertResultList(env, &od_results);
+    return convertResultList(env, data, &data->od_results);
 }
 
+// 初始化方法：为当前线程创建局部数据
 extern "C"
 JNIEXPORT jboolean JNICALL
-Java_com_example_cameraxtest_MainActivity_nativePrepare(JNIEnv *env, jobject thiz, jstring modelpath, jstring labelPath)
+Java_com_example_cameraxtest_MainActivity_nativePrepare(JNIEnv *env, jclass thiz,
+                                                        jstring modelpath, jstring labelPath)
 {
+    // 如果当前线程已有数据，先释放
+    if (tlsData != nullptr)
+    {
+        releaseThreadRefs(env, tlsData);
+        delete[] tlsData->background;
+        release_yolov8_model(&tlsData->rknn_app_ctx);
+        delete tlsData;
+    }
+
+    // 为当前线程创建新的局部数据
+    tlsData = new ThreadLocalData();
     int ret;
 
     const char *model_path = env->GetStringUTFChars(modelpath, nullptr);
     const char *label_path = env->GetStringUTFChars(labelPath, nullptr);
 
     ret = init_post_process(label_path);
-    if(ret != 0)
+    if (ret != 0)
     {
         LOGI("init_post_process fail! ret=%d label_path=%s\n", ret, label_path);
         return false;
     }
-    ret = init_yolov8_model(model_path, &rknn_app_ctx);
+    ret = init_yolov8_model(model_path, &tlsData->rknn_app_ctx);
     if (ret != 0)
     {
         LOGI("init_yolov8_model fail! ret=%d model_path=%s\n", ret, model_path);
         return false;
     }
 
-    //rknn_set_core_mask(rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_ALL);
+    if (core_mask == 0)
+    {
+        rknn_set_core_mask(tlsData->rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_0);
+        core_mask++;
+    }
+    else if (core_mask == 1)
+    {
+        rknn_set_core_mask(tlsData->rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_1);
+        core_mask++;
+    }
+    else if (core_mask == 2)
+    {
+        rknn_set_core_mask(tlsData->rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_2);
+        core_mask++;
+    }
+    else if(core_mask > 2)
+    {
+        rknn_set_core_mask(tlsData->rknn_app_ctx.rknn_ctx, RKNN_NPU_CORE_AUTO);
+    }
 
-    //letterbox是必要的
-    letter_box.x_pad = 0;
-    letter_box.y_pad = 64;
-    letter_box.scale = 0.5f;
+    LOGI("%d", core_mask);
 
-    //查找类的引用和方法
-    initRefs(env);
+    // 初始化当前线程的引用
+    if (!initThreadRefs(env, tlsData)) {
+        LOGI("initThreadRefs failed");
+        return false;
+    }
 
+    env->ReleaseStringUTFChars(modelpath, model_path);
+    env->ReleaseStringUTFChars(labelPath, label_path);
     return true;
 }
+
+// 销毁方法：释放当前线程的局部数据
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_example_cameraxtest_MainActivity_nativeDestroy(JNIEnv *env, jobject thiz)
+Java_com_example_cameraxtest_MainActivity_nativeDestroy(JNIEnv *env, jclass thiz)
 {
-    int ret;
+    if (tlsData == nullptr) return;
 
+    // 释放当前线程的资源
     deinit_post_process();
-    ret = release_yolov8_model(&rknn_app_ctx);
-    if (ret != 0)
-    {
-        LOGI("release_yolov8_model fail! ret=%d\n", ret);
-    }
-    delete[] background;
+    release_yolov8_model(&tlsData->rknn_app_ctx);
+    delete[] tlsData->background;
+    releaseThreadRefs(env, tlsData);
 
-    releaseRefs(env);
+    // 清空当前线程的局部数据
+    delete tlsData;
+    tlsData = nullptr;
 }
 

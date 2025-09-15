@@ -49,11 +49,16 @@ import com.google.common.util.concurrent.ListenableFuture;
 
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-public class MainActivity extends AppCompatActivity
+public class MainActivity extends AppCompatActivity implements DataProvider
 {
     static
     {
@@ -65,10 +70,15 @@ public class MainActivity extends AppCompatActivity
     private ProcessCameraProvider cameraProvider;
     private FrameLayout frameLayout;
 
+    public String modelPath;
+    public String labelPath;
+
     DetectionView detectionView;
 
-    private int counttest = 0;
-    private long timetest = 0;
+    private AtomicInteger counttest = new AtomicInteger(0);
+    private AtomicLong timetest = new AtomicLong(0);
+    
+    protected ThreadPoolExecutor threadpool;
 
     @Override
     protected void onCreate(Bundle savedInstanceState)
@@ -81,14 +91,20 @@ public class MainActivity extends AppCompatActivity
         detectionView = new DetectionView(this);
         frameLayout.addView(detectionView);
 
-        String modelPath = AssetFileCopier.copyAssetToInternalStorage(this, "yolov8.rknn");
-        String labelPath = AssetFileCopier.copyAssetToInternalStorage(this, "coco_80_labels_list.txt");
+        modelPath = AssetFileCopier.copyAssetToInternalStorage(this, "yolov8m.rknn");
+        labelPath = AssetFileCopier.copyAssetToInternalStorage(this, "coco_80_labels_list.txt");
         Log.e("MODEL",modelPath);
         Log.e("LABEL",labelPath);
-        if(!nativePrepare(modelPath, labelPath))
-        {
-            Log.e("prepare","nativePrepare failed");
-        }
+
+        threadpool = new ThreadPoolExecutor(
+                3,
+                3,
+                0,
+                TimeUnit.MINUTES,
+                new ArrayBlockingQueue<Runnable>(5),
+                new ResourceThreadFactory(this),
+                new ThreadPoolExecutor.DiscardOldestPolicy()
+                );
 
         //高版本系统动态权限申请
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
@@ -163,9 +179,10 @@ public class MainActivity extends AppCompatActivity
                 .build();
 
         //不填参数的话, 默认格式YUV_420_888, 对于此相机来说, 具体是yuv420sp nv12.
-        imageAnalysis.setAnalyzer(Executors.newSingleThreadExecutor(), image ->
+        imageAnalysis.setAnalyzer(threadpool, image ->
         {
             // 获取图像格式信息
+            Log.e("debug", "线程["+Thread.currentThread().getId()+"] 正在处理图像");
             int format = image.getFormat();
             String formatName = getFormatName(format);
 
@@ -188,22 +205,37 @@ public class MainActivity extends AppCompatActivity
                 detectionView.setScale(image.getWidth(), frameLayout.getWidth());
                 detectionView.setResults(resultList);
             }
+/*
+            long cost = end - start;
+            int currentCount = counttest.incrementAndGet();
+            timetest.addAndGet(cost);
 
-            counttest++;
-            timetest += end-start;
-            if(counttest%50 == 0)
-            {
-                //预处理约2.7ms 推理约25.6ms 后处理约2.4ms(置信度0.25时)
-                timetest /= 50; //五十次的平均值
-                Log.e("TIME", "图片处理平均耗时: " + timetest/1000000.0 + "毫秒");
-                timetest = 0;
+            // 每50次计算一次平均耗时（日志操作可在子线程执行）
+            if (currentCount % 50 == 0) {
+                long avgTime = timetest.get() / 50;
+                Log.e("TIME", "图片处理平均耗时: " + avgTime / 1000000.0 + "毫秒");
+                Log.e(TAG, "图像大小: " + width + "x" + height);
+                // 重置统计值
+                timetest.set(0);
             }
-
+*/
             image.close();
         });
 
         cameraProvider.unbindAll();//解绑组件
         Camera camera = cameraProvider.bindToLifecycle((LifecycleOwner) this, cameraSelector, preview, imageAnalysis);
+    }
+
+    @Override
+    public String getModelPath()
+    {
+        return modelPath;
+    }
+
+    @Override
+    public String getLabelPath()
+    {
+        return labelPath;
     }
 
     // 辅助方法：将图像格式代码转换为可读名称
@@ -226,11 +258,19 @@ public class MainActivity extends AppCompatActivity
     protected void onDestroy()
     {
         super.onDestroy();
-        nativeDestroy();
         cameraProvider.unbindAll();
+        threadpool.shutdown();
+        try
+        {
+            threadpool.awaitTermination(1, TimeUnit.MINUTES);
+        } catch (InterruptedException e)
+        {
+            throw new RuntimeException(e);
+        }
+        System.out.println("线程池已关闭");
     }
 
-    private native DetectResultList imgInference(ByteBuffer img, int width, int height);
-    private native boolean nativePrepare(String path, String labelPath);
-    private native void nativeDestroy();
+    static public native DetectResultList imgInference(ByteBuffer img, int width, int height);
+    static public native boolean nativePrepare(String path, String labelPath);
+    static public native void nativeDestroy();
 }
